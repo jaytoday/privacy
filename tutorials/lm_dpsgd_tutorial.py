@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """Training a language model (recurrent neural network) with DP-SGD optimizer.
 
 This tutorial uses a corpus of text from TensorFlow datasets unless a
@@ -31,33 +30,36 @@ using the exposure metric of https://arxiv.org/abs/1802.08232.
 This example is decribed in more details in this post: https://goo.gl/UKr7vH
 """
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import os
+
+from absl import app
+from absl import flags
+from absl import logging
+import dp_accounting
 import numpy as np
 import tensorflow as tf
+from tensorflow import estimator as tf_estimator
+from tensorflow.compat.v1 import estimator as tf_compat_v1_estimator
 import tensorflow_datasets as tfds
+from tensorflow_privacy.privacy.optimizers import dp_optimizer
 
-from privacy.analysis.rdp_accountant import compute_rdp
-from privacy.analysis.rdp_accountant import get_privacy_spent
-from privacy.optimizers import dp_optimizer
 
-tf.flags.DEFINE_boolean('dpsgd', True, 'If True, train with DP-SGD. If False, '
-                        'train with vanilla SGD.')
-tf.flags.DEFINE_float('learning_rate', .001, 'Learning rate for training')
-tf.flags.DEFINE_float('noise_multiplier', 0.001,
-                      'Ratio of the standard deviation to the clipping norm')
-tf.flags.DEFINE_float('l2_norm_clip', 1.0, 'Clipping norm')
-tf.flags.DEFINE_integer('batch_size', 256, 'Batch size')
-tf.flags.DEFINE_integer('epochs', 60, 'Number of epochs')
-tf.flags.DEFINE_integer('microbatches', 256, 'Number of microbatches '
-                        '(must evenly divide batch_size)')
-tf.flags.DEFINE_string('model_dir', None, 'Model directory')
-tf.flags.DEFINE_string('data_dir', None, 'Directory containing the PTB data.')
+flags.DEFINE_boolean(
+    'dpsgd', True, 'If True, train with DP-SGD. If False, '
+    'train with vanilla SGD.')
+flags.DEFINE_float('learning_rate', 0.001, 'Learning rate for training')
+flags.DEFINE_float('noise_multiplier', 0.001,
+                   'Ratio of the standard deviation to the clipping norm')
+flags.DEFINE_float('l2_norm_clip', 1.0, 'Clipping norm')
+flags.DEFINE_integer('batch_size', 256, 'Batch size')
+flags.DEFINE_integer('epochs', 60, 'Number of epochs')
+flags.DEFINE_integer(
+    'microbatches', 256, 'Number of microbatches '
+    '(must evenly divide batch_size)')
+flags.DEFINE_string('model_dir', None, 'Model directory')
+flags.DEFINE_string('data_dir', None, 'Directory containing the PTB data.')
 
-FLAGS = tf.flags.FLAGS
+FLAGS = flags.FLAGS
 
 SEQ_LEN = 80
 NB_TRAIN = 45000
@@ -71,8 +73,8 @@ def rnn_model_fn(features, labels, mode):  # pylint: disable=unused-argument
   x = tf.reshape(x, [-1, SEQ_LEN])
   input_layer = x[:, :-1]
   input_one_hot = tf.one_hot(input_layer, 256)
-  lstm = tf.keras.layers.LSTM(256, return_sequences=True).apply(input_one_hot)
-  logits = tf.keras.layers.Dense(256).apply(lstm)
+  lstm = tf.keras.layers.LSTM(256, return_sequences=True)(input_one_hot)
+  logits = tf.keras.layers.Dense(256)(lstm)
 
   # Calculate loss as a vector (to support microbatches in DP-SGD).
   vector_loss = tf.nn.softmax_cross_entropy_with_logits(
@@ -82,37 +84,35 @@ def rnn_model_fn(features, labels, mode):  # pylint: disable=unused-argument
   scalar_loss = tf.reduce_mean(vector_loss)
 
   # Configure the training op (for TRAIN mode).
-  if mode == tf.estimator.ModeKeys.TRAIN:
+  if mode == tf_estimator.ModeKeys.TRAIN:
     if FLAGS.dpsgd:
+
       optimizer = dp_optimizer.DPAdamGaussianOptimizer(
           l2_norm_clip=FLAGS.l2_norm_clip,
           noise_multiplier=FLAGS.noise_multiplier,
           num_microbatches=FLAGS.microbatches,
           learning_rate=FLAGS.learning_rate,
-          unroll_microbatches=True,
-          population_size=NB_TRAIN)
+          unroll_microbatches=True)
       opt_loss = vector_loss
     else:
-      optimizer = tf.train.AdamOptimizer(
+      optimizer = tf.compat.v1.train.AdamOptimizer(
           learning_rate=FLAGS.learning_rate)
       opt_loss = scalar_loss
-    global_step = tf.train.get_global_step()
+    global_step = tf.compat.v1.train.get_global_step()
     train_op = optimizer.minimize(loss=opt_loss, global_step=global_step)
-    return tf.estimator.EstimatorSpec(mode=mode,
-                                      loss=scalar_loss,
-                                      train_op=train_op)
+    return tf_estimator.EstimatorSpec(
+        mode=mode, loss=scalar_loss, train_op=train_op)
 
   # Add evaluation metrics (for EVAL mode).
-  elif mode == tf.estimator.ModeKeys.EVAL:
+  elif mode == tf_estimator.ModeKeys.EVAL:
     eval_metric_ops = {
         'accuracy':
             tf.metrics.accuracy(
                 labels=tf.cast(x[:, 1:], dtype=tf.int32),
                 predictions=tf.argmax(input=logits, axis=2))
     }
-    return tf.estimator.EstimatorSpec(mode=mode,
-                                      loss=scalar_loss,
-                                      eval_metric_ops=eval_metric_ops)
+    return tf_estimator.EstimatorSpec(
+        mode=mode, loss=scalar_loss, eval_metric_ops=eval_metric_ops)
 
 
 def load_data():
@@ -120,14 +120,15 @@ def load_data():
   if not FLAGS.data_dir:
     print('FLAGS.data_dir containing train.txt and test.txt was not specified, '
           'using a substitute dataset from the tensorflow_datasets module.')
-    train_dataset = tfds.load(name='lm1b/subwords8k',
-                              split=tfds.Split.TRAIN,
-                              batch_size=NB_TRAIN)
-    test_dataset = tfds.load(name='lm1b/subwords8k',
-                             split=tfds.Split.TEST,
-                             batch_size=10000)
-    train_data = next(tfds.as_numpy(train_dataset))
-    test_data = next(tfds.as_numpy(test_dataset))
+    train_dataset = tfds.load(
+        name='lm1b/subwords8k',
+        split=tfds.Split.TRAIN,
+        batch_size=NB_TRAIN,
+        shuffle_files=True)
+    test_dataset = tfds.load(
+        name='lm1b/subwords8k', split=tfds.Split.TEST, batch_size=10000)
+    train_data = next(iter(tfds.as_numpy(train_dataset)))
+    test_data = next(iter(tfds.as_numpy(test_dataset)))
     train_data = train_data['text'].flatten()
     test_data = test_data['text'].flatten()
   else:
@@ -149,16 +150,21 @@ def compute_epsilon(steps):
     return float('inf')
   orders = [1 + x / 10. for x in range(1, 100)] + list(range(12, 64))
   sampling_probability = FLAGS.batch_size / NB_TRAIN
-  rdp = compute_rdp(q=sampling_probability,
-                    noise_multiplier=FLAGS.noise_multiplier,
-                    steps=steps,
-                    orders=orders)
+
+  accountant = dp_accounting.rdp.RdpAccountant(orders)
+  event = dp_accounting.SelfComposedDpEvent(
+      dp_accounting.PoissonSampledDpEvent(
+          sampling_probability,
+          dp_accounting.GaussianDpEvent(FLAGS.noise_multiplier)), steps)
+  accountant.compose(event)
+
   # Delta is set to 1e-5 because Penn TreeBank has 60000 training points.
-  return get_privacy_spent(orders, rdp, target_delta=1e-5)[0]
+  return accountant.get_epsilon(target_delta=1e-5)
 
 
 def main(unused_argv):
-  tf.logging.set_verbosity(tf.logging.INFO)
+  logging.set_verbosity(logging.INFO)
+
   if FLAGS.batch_size % FLAGS.microbatches != 0:
     raise ValueError('Number of microbatches should divide evenly batch_size')
 
@@ -166,21 +172,20 @@ def main(unused_argv):
   train_data, test_data = load_data()
 
   # Instantiate the tf.Estimator.
-  conf = tf.estimator.RunConfig(save_summary_steps=1000)
-  lm_classifier = tf.estimator.Estimator(model_fn=rnn_model_fn,
-                                         model_dir=FLAGS.model_dir,
-                                         config=conf)
+  conf = tf_estimator.RunConfig(save_summary_steps=1000)
+  lm_classifier = tf_estimator.Estimator(
+      model_fn=rnn_model_fn, model_dir=FLAGS.model_dir, config=conf)
 
   # Create tf.Estimator input functions for the training and test data.
   batch_len = FLAGS.batch_size * SEQ_LEN
   train_data_end = len(train_data) - len(train_data) % batch_len
   test_data_end = len(test_data) - len(test_data) % batch_len
-  train_input_fn = tf.estimator.inputs.numpy_input_fn(
+  train_input_fn = tf_compat_v1_estimator.inputs.numpy_input_fn(
       x={'x': train_data[:train_data_end]},
       batch_size=batch_len,
       num_epochs=FLAGS.epochs,
       shuffle=False)
-  eval_input_fn = tf.estimator.inputs.numpy_input_fn(
+  eval_input_fn = tf_compat_v1_estimator.inputs.numpy_input_fn(
       x={'x': test_data[:test_data_end]},
       batch_size=batch_len,
       num_epochs=1,
@@ -208,5 +213,6 @@ def main(unused_argv):
     else:
       print('Trained with vanilla non-private SGD optimizer')
 
+
 if __name__ == '__main__':
-  tf.app.run()
+  app.run(main)

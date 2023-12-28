@@ -12,38 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Training a CNN on MNIST in TF Eager mode with DP-SGD optimizer."""
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
+from absl import app
+from absl import flags
+import dp_accounting
 import numpy as np
 import tensorflow as tf
+from tensorflow_privacy.privacy.optimizers.dp_optimizer import DPGradientDescentGaussianOptimizer
 
-from privacy.analysis.rdp_accountant import compute_rdp
-from privacy.analysis.rdp_accountant import get_privacy_spent
-from privacy.optimizers.dp_optimizer import DPGradientDescentOptimizer
-from privacy.optimizers.gaussian_query import GaussianAverageQuery
+GradientDescentOptimizer = tf.compat.v1.train.GradientDescentOptimizer
+tf.compat.v1.enable_eager_execution()
 
-# Compatibility with tf 1 and 2 APIs
-try:
-  GradientDescentOptimizer = tf.train.GradientDescentOptimizer
-except:  # pylint: disable=bare-except
-  GradientDescentOptimizer = tf.optimizers.SGD  # pylint: disable=invalid-name
+flags.DEFINE_boolean(
+    'dpsgd', True, 'If True, train with DP-SGD. If False, '
+    'train with vanilla SGD.')
+flags.DEFINE_float('learning_rate', 0.15, 'Learning rate for training')
+flags.DEFINE_float('noise_multiplier', 1.1,
+                   'Ratio of the standard deviation to the clipping norm')
+flags.DEFINE_float('l2_norm_clip', 1.0, 'Clipping norm')
+flags.DEFINE_integer('batch_size', 250, 'Batch size')
+flags.DEFINE_integer('epochs', 60, 'Number of epochs')
+flags.DEFINE_integer(
+    'microbatches', 250, 'Number of microbatches '
+    '(must evenly divide batch_size)')
 
-tf.enable_eager_execution()
-
-tf.flags.DEFINE_boolean('dpsgd', True, 'If True, train with DP-SGD. If False, '
-                        'train with vanilla SGD.')
-tf.flags.DEFINE_float('learning_rate', 0.15, 'Learning rate for training')
-tf.flags.DEFINE_float('noise_multiplier', 1.1,
-                      'Ratio of the standard deviation to the clipping norm')
-tf.flags.DEFINE_float('l2_norm_clip', 1.0, 'Clipping norm')
-tf.flags.DEFINE_integer('batch_size', 250, 'Batch size')
-tf.flags.DEFINE_integer('epochs', 60, 'Number of epochs')
-tf.flags.DEFINE_integer('microbatches', 250, 'Number of microbatches '
-                        '(must evenly divide batch_size)')
-
-FLAGS = tf.app.flags.FLAGS
+FLAGS = flags.FLAGS
 
 
 def compute_epsilon(steps):
@@ -51,16 +44,24 @@ def compute_epsilon(steps):
   if FLAGS.noise_multiplier == 0.0:
     return float('inf')
   orders = [1 + x / 10. for x in range(1, 100)] + list(range(12, 64))
+  accountant = dp_accounting.rdp.RdpAccountant(orders)
+
   sampling_probability = FLAGS.batch_size / 60000
-  rdp = compute_rdp(q=sampling_probability,
-                    noise_multiplier=FLAGS.noise_multiplier,
-                    steps=steps,
-                    orders=orders)
+  event = dp_accounting.SelfComposedDpEvent(
+      dp_accounting.PoissonSampledDpEvent(
+          sampling_probability,
+          dp_accounting.GaussianDpEvent(FLAGS.noise_multiplier)), steps)
+
+  accountant.compose(event)
+
   # Delta is set to 1e-5 because MNIST has 60000 training points.
-  return get_privacy_spent(orders, rdp, target_delta=1e-5)[0]
+  return accountant.get_epsilon(target_delta=1e-5)
 
 
 def main(_):
+  if FLAGS.dpsgd and FLAGS.batch_size % FLAGS.microbatches != 0:
+    raise ValueError('Number of microbatches should divide evenly batch_size')
+
   # Fetch the mnist data
   train, test = tf.keras.datasets.mnist.load_data()
   train_images, train_labels = train
@@ -68,22 +69,20 @@ def main(_):
 
   # Create a dataset object and batch for the training data
   dataset = tf.data.Dataset.from_tensor_slices(
-      (tf.cast(train_images[..., tf.newaxis]/255, tf.float32),
-       tf.cast(train_labels, tf.int64)))
+      (tf.cast(train_images[..., tf.newaxis] / 255,
+               tf.float32), tf.cast(train_labels, tf.int64)))
   dataset = dataset.shuffle(1000).batch(FLAGS.batch_size)
 
   # Create a dataset object and batch for the test data
   eval_dataset = tf.data.Dataset.from_tensor_slices(
-      (tf.cast(test_images[..., tf.newaxis]/255, tf.float32),
-       tf.cast(test_labels, tf.int64)))
+      (tf.cast(test_images[..., tf.newaxis] / 255,
+               tf.float32), tf.cast(test_labels, tf.int64)))
   eval_dataset = eval_dataset.batch(10000)
 
   # Define the model using tf.keras.layers
   mnist_model = tf.keras.Sequential([
-      tf.keras.layers.Conv2D(16, 8,
-                             strides=2,
-                             padding='same',
-                             activation='relu'),
+      tf.keras.layers.Conv2D(
+          16, 8, strides=2, padding='same', activation='relu'),
       tf.keras.layers.MaxPool2D(2, 1),
       tf.keras.layers.Conv2D(32, 4, strides=2, activation='relu'),
       tf.keras.layers.MaxPool2D(2, 1),
@@ -94,13 +93,10 @@ def main(_):
 
   # Instantiate the optimizer
   if FLAGS.dpsgd:
-    dp_average_query = GaussianAverageQuery(
-        FLAGS.l2_norm_clip,
-        FLAGS.l2_norm_clip * FLAGS.noise_multiplier,
-        FLAGS.microbatches)
-    opt = DPGradientDescentOptimizer(
-        dp_average_query,
-        FLAGS.microbatches,
+    opt = DPGradientDescentGaussianOptimizer(
+        l2_norm_clip=FLAGS.l2_norm_clip,
+        noise_multiplier=FLAGS.noise_multiplier,
+        num_microbatches=FLAGS.microbatches,
         learning_rate=FLAGS.learning_rate)
   else:
     opt = GradientDescentOptimizer(learning_rate=FLAGS.learning_rate)
@@ -118,35 +114,35 @@ def main(_):
         # In Eager mode, the optimizer takes a function that returns the loss.
         def loss_fn():
           logits = mnist_model(images, training=True)  # pylint: disable=undefined-loop-variable,cell-var-from-loop
-          loss = tf.losses.sparse_softmax_cross_entropy(
-              labels, logits, reduction=tf.losses.Reduction.NONE)  # pylint: disable=undefined-loop-variable,cell-var-from-loop
+          loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
+              labels=labels, logits=logits)  # pylint: disable=undefined-loop-variable,cell-var-from-loop
           # If training without privacy, the loss is a scalar not a vector.
           if not FLAGS.dpsgd:
-            loss = tf.reduce_mean(loss)
+            loss = tf.reduce_mean(input_tensor=loss)
           return loss
 
         if FLAGS.dpsgd:
-          grads_and_vars = opt.compute_gradients(loss_fn, var_list,
-                                                 gradient_tape=gradient_tape)
+          grads_and_vars = opt.compute_gradients(
+              loss_fn, var_list, gradient_tape=gradient_tape)
         else:
           grads_and_vars = opt.compute_gradients(loss_fn, var_list)
 
-      global_step = tf.train.get_or_create_global_step()
-      opt.apply_gradients(grads_and_vars, global_step=global_step)
+      opt.apply_gradients(grads_and_vars)
 
     # Evaluate the model and print results
     for (_, (images, labels)) in enumerate(eval_dataset.take(-1)):
       logits = mnist_model(images, training=False)
-      correct_preds = tf.equal(tf.argmax(logits, axis=1), labels)
+      correct_preds = tf.equal(tf.argmax(input=logits, axis=1), labels)
     test_accuracy = np.mean(correct_preds.numpy())
     print('Test accuracy after epoch %d is: %.3f' % (epoch, test_accuracy))
 
     # Compute the privacy budget expended so far.
     if FLAGS.dpsgd:
-      eps = compute_epsilon(epoch * steps_per_epoch)
+      eps = compute_epsilon((epoch + 1) * steps_per_epoch)
       print('For delta=1e-5, the current epsilon is: %.2f' % eps)
     else:
       print('Trained with vanilla non-private SGD optimizer')
 
+
 if __name__ == '__main__':
-  tf.app.run(main)
+  app.run(main)
